@@ -427,12 +427,29 @@
 
         function MinecraftItemBuilder() {
             const [catalogueItems, setCatalogueItems] = useState([]);
-            const [cells, setCells] = useState([{ id: 1, slots: Array(50).fill(null) }]);
+            const [cells, setCells] = useState(() => {
+                const saved = localStorage.getItem('minecraftBuilder_cells');
+                if (saved) {
+                    const parsedCells = JSON.parse(saved);
+                    // Migrate old 50-slot cells to 54-slot cells
+                    return parsedCells.map(cell => {
+                        if (cell.slots.length === 50) {
+                            // Add 4 more null slots to make it 54
+                            return { ...cell, slots: [...cell.slots, null, null, null, null] };
+                        }
+                        return cell;
+                    });
+                }
+                return [{ id: 1, slots: Array(54).fill(null) }];
+            });
             const [draggedItem, setDraggedItem] = useState(null);
             const [draggedSlot, setDraggedSlot] = useState(null);
             const [draggedCell, setDraggedCell] = useState(null);
             const [dragOverSlot, setDragOverSlot] = useState(null);
-            const [nextCellId, setNextCellId] = useState(2);
+            const [nextCellId, setNextCellId] = useState(() => {
+                const saved = localStorage.getItem('minecraftBuilder_nextCellId');
+                return saved ? parseInt(saved, 10) : 2;
+            });
             const [searchTerm, setSearchTerm] = useState('');
             const [loading, setLoading] = useState(true);
             const [showColorPicker, setShowColorPicker] = useState(false);
@@ -440,12 +457,16 @@
             const [satRange, setSatRange] = useState([0, 100]);
             const [lumRange, setLumRange] = useState([0, 100]);
             const [moveAllMode, setMoveAllMode] = useState(false);
+            const [displayMode, setDisplayMode] = useState(false); // false = normal, true = redstone optimization
+            const [rejectedItems, setRejectedItems] = useState([]); // Array of item IDs rejected from fill level adjustment
             const [selectedSlots, setSelectedSlots] = useState([]); // Array of {cellId, slotIndex}
             const [lastSelectedSlot, setLastSelectedSlot] = useState(null); // For shift-click range selection
             const [dragOverCell, setDragOverCell] = useState(null); // Track which cell is being dragged over
             const [categoryFilter, setCategoryFilter] = useState('');
             const [groupFilter, setGroupFilter] = useState('');
             const [materialFilter, setMaterialFilter] = useState('');
+            const [stackSizeFilters, setStackSizeFilters] = useState({ 1: false, 16: false, 64: false });
+            const [rarityFilters, setRarityFilters] = useState({ "common": false, "uncommon": false, "rare": false, "epic": false });
             const [showCategorySuggestions, setShowCategorySuggestions] = useState(false);
             const [showGroupSuggestions, setShowGroupSuggestions] = useState(false);
             const [showMaterialSuggestions, setShowMaterialSuggestions] = useState(false);
@@ -488,6 +509,25 @@
                         });
 
                         setCatalogueItems(processedData);
+
+                        const savedCells = localStorage.getItem('minecraftBuilder_cells');
+                        if (savedCells) {
+                            try {
+                                const parsedCells = JSON.parse(savedCells);
+                                const restoredCells = parsedCells.map(cell => ({
+                                    ...cell,
+                                    slots: cell.slots.map(slot => {
+                                        if (!slot || !slot.id) return null;
+                                        // Match item by id from catalogue
+                                        return processedData.find(item => item.id === slot.id) || null;
+                                    })
+                                }));
+                                setCells(restoredCells);
+                            } catch (e) {
+                                console.error('Error restoring cells:', e);
+                            }
+                        }
+
                         setLoading(false);
                     })
                     .catch(error => {
@@ -496,6 +536,14 @@
                         setLoading(false);
                     });
             }, []);
+
+            useEffect(() => {
+                localStorage.setItem('minecraftBuilder_cells', JSON.stringify(cells));
+            }, [cells]);
+
+            useEffect(() => {
+                localStorage.setItem('minecraftBuilder_nextCellId', nextCellId.toString());
+            }, [nextCellId]);
 
             // Handle divider dragging
             useEffect(() => {
@@ -590,6 +638,22 @@
                     );
                 }
 
+                // Apply stack size filter
+                const activeStackSizes = Object.keys(stackSizeFilters).filter(size => stackSizeFilters[size]).map(Number);
+                if (activeStackSizes.length > 0) {
+                    filtered = filtered.filter(item =>
+                        item.stack_size && activeStackSizes.includes(item.stack_size)
+                    );
+                }
+
+                // Apply rarity filter
+                const activeRarities = Object.keys(rarityFilters).filter(size => rarityFilters[size]).map(String);
+                if (activeRarities.length > 0) {
+                    filtered = filtered.filter(item =>
+                        item.rarity && activeRarities.includes(item.rarity)
+                    );
+                }
+
                 // Apply color filter if not at default ranges
                 const isColorFiltered = hueRange[0] !== 0 || hueRange[1] !== 360 ||
                                        satRange[0] !== 0 || satRange[1] !== 100 ||
@@ -651,7 +715,7 @@
                 }
 
                 return filtered;
-            }, [catalogueItems, usedItemIds, searchTerm, hueRange, satRange, lumRange, categoryFilter, groupFilter, materialFilter]);
+            }, [catalogueItems, usedItemIds, searchTerm, hueRange, satRange, lumRange, categoryFilter, groupFilter, materialFilter, stackSizeFilters, rarityFilters]);
 
             // Save current state to history (keep last 10)
             const saveToHistory = () => {
@@ -788,7 +852,7 @@
 
             const addCell = () => {
                 saveToHistory();
-                setCells([...cells, { id: nextCellId, slots: Array(50).fill(null) }]);
+                setCells([...cells, { id: nextCellId, slots: Array(54).fill(null) }]);
                 setNextCellId(nextCellId + 1);
             };
 
@@ -840,14 +904,28 @@
                                 return item || null;
                             });
 
-                            // Ensure exactly 50 slots
-                            while (slots.length < 50) slots.push(null);
-                            if (slots.length > 50) slots.length = 50;
+                            // Check if this is an old 50-slot layout
+                            const isOldLayout = slots.length === 50;
 
-                            return {
-                                id: nextCellId + index,
-                                slots: slots
-                            };
+                            if (isOldLayout) {
+                                // Old layout: shift all items up by 1 to make room for reserved slot 0
+                                // New layout: [null (reserved), ...old items, ...padding to 54]
+                                const migratedSlots = [null, ...slots];
+                                // Pad to 54 slots
+                                while (migratedSlots.length < 54) migratedSlots.push(null);
+                                return {
+                                    id: nextCellId + index,
+                                    slots: migratedSlots
+                                };
+                            } else {
+                                // New layout or different size - ensure exactly 54 slots
+                                while (slots.length < 54) slots.push(null);
+                                if (slots.length > 54) slots.length = 54;
+                                return {
+                                    id: nextCellId + index,
+                                    slots: slots
+                                };
+                            }
                         });
 
                         setCells(newCells);
@@ -995,13 +1073,14 @@
                 if (draggedItem && draggedItem.source.type === 'catalogue') {
                     // Dragging from catalogue - always INSERT (displace items)
                     if (moveAllMode) {
-                        // Fill all empty slots with filtered items
+                        // Fill all empty slots with filtered items (skip slot 0)
                         setCells(cells.map(cell => {
                             if (cell.id === cellId) {
                                 const newSlots = [...cell.slots];
                                 let itemIndex = 0;
 
-                                for (let i = 0; i < newSlots.length && itemIndex < availableItems.length; i++) {
+                                // Start at i = 1 to skip reserved slot 0
+                                for (let i = 1; i < newSlots.length && itemIndex < availableItems.length; i++) {
                                     if (newSlots[i] === null) {
                                         newSlots[i] = availableItems[itemIndex];
                                         itemIndex++;
@@ -1017,23 +1096,27 @@
                         setCells(cells.map(cell => {
                             if (cell.id === cellId) {
                                 const newSlots = [...cell.slots];
-                                // Remove nulls to compact
-                                const compacted = newSlots.filter(slot => slot !== null);
+                                // Keep slot 0 reserved, compact slots 1-53
+                                const compacted = newSlots.slice(1).filter(slot => slot !== null);
+
+                                // Adjust insert position (account for reserved slot 0)
+                                const adjustedSlotIndex = Math.max(0, slotIndex - 1);
 
                                 // Insert at target position
-                                compacted.splice(slotIndex, 0, draggedItem.item);
+                                compacted.splice(adjustedSlotIndex, 0, draggedItem.item);
 
-                                // Trim to 50 slots
-                                if (compacted.length > 50) {
-                                    compacted.length = 50;
+                                // Trim to 53 usable slots
+                                if (compacted.length > 53) {
+                                    compacted.length = 53;
                                 }
 
                                 // Pad with nulls
-                                while (compacted.length < 50) {
+                                while (compacted.length < 53) {
                                     compacted.push(null);
                                 }
 
-                                return { ...cell, slots: compacted };
+                                // Reconstruct with slot 0 as null
+                                return { ...cell, slots: [null, ...compacted] };
                             }
                             return cell;
                         }));
@@ -1078,6 +1161,7 @@
                                     const selectedIndices = draggedSlot.selectedSlots
                                         .filter(s => s.cellId === cellId)
                                         .map(s => s.slotIndex)
+                                        .filter(idx => idx > 0) // Exclude slot 0
                                         .sort((a, b) => a - b);
 
                                     // Check if drop target is within the selection itself
@@ -1087,9 +1171,9 @@
                                         return cell;
                                     }
 
-                                    // Step 1: Collect selected items and remove them
+                                    // Step 1: Collect selected items and remove them (preserve slot 0)
                                     const selectedItems = selectedIndices.map(idx => newSlots[idx]);
-                                    const remainingSlots = newSlots.filter((slot, idx) => !selectedIndices.includes(idx));
+                                    const remainingSlots = newSlots.filter((slot, idx) => idx === 0 || !selectedIndices.includes(idx));
 
                                     // Step 2: Calculate adjusted insertion index
                                     // Count how many selected slots are before the drop target
@@ -1103,10 +1187,13 @@
                                         ...remainingSlots.slice(adjustedInsertIndex)
                                     ];
 
-                                    // Pad with nulls to maintain 50 slots
-                                    while (finalSlots.length < 50) {
+                                    // Pad with nulls to maintain 54 slots
+                                    while (finalSlots.length < 54) {
                                         finalSlots.push(null);
                                     }
+
+                                    // Ensure slot 0 is null
+                                    finalSlots[0] = null;
 
                                     return { ...cell, slots: finalSlots };
                                 } else {
@@ -1118,22 +1205,22 @@
                                         }
                                     });
 
-                                    // Step 2: Compact to remove gaps
-                                    let compacted = newSlots.filter(slot => slot !== null);
+                                    // Step 2: Compact to remove gaps (preserve slot 0)
+                                    let compacted = newSlots.slice(1).filter(slot => slot !== null);
 
                                     // Step 3: Calculate insertion point in compacted array
-                                    let insertIndex = slotIndex;
+                                    let insertIndex = Math.max(0, slotIndex - 1);
                                     // Adjust if some slots before target were null
                                     let nullsBefore = 0;
-                                    for (let i = 0; i < slotIndex && i < cell.slots.length; i++) {
+                                    for (let i = 1; i < slotIndex && i < cell.slots.length; i++) {
                                         if (cell.slots[i] === null) nullsBefore++;
                                     }
-                                    insertIndex = Math.max(0, slotIndex - nullsBefore);
+                                    insertIndex = Math.max(0, insertIndex - nullsBefore);
                                     insertIndex = Math.min(insertIndex, compacted.length);
 
-                                    // Step 4: Check if items will fit
+                                    // Step 4: Check if items will fit (53 usable slots)
                                     const totalItems = compacted.length + itemsToMove.length;
-                                    if (totalItems > 50) {
+                                    if (totalItems > 53) {
                                         // Won't fit - cancel operation
                                         // Return original slots for this cell
                                         return cell;
@@ -1147,11 +1234,12 @@
                                     ];
 
                                     // Pad with nulls
-                                    while (finalSlots.length < 50) {
+                                    while (finalSlots.length < 53) {
                                         finalSlots.push(null);
                                     }
 
-                                    return { ...cell, slots: finalSlots };
+                                    // Reconstruct with slot 0 as null
+                                    return { ...cell, slots: [null, ...finalSlots] };
                                 }
                             } else {
                                 // Not the target cell - just remove moved items and compact
@@ -1162,12 +1250,13 @@
                                     }
                                 });
 
-                                const compacted = newSlots.filter(slot => slot !== null);
-                                while (compacted.length < 50) {
+                                // Compact slots 1-53, preserve slot 0
+                                const compacted = newSlots.slice(1).filter(slot => slot !== null);
+                                while (compacted.length < 53) {
                                     compacted.push(null);
                                 }
 
-                                return { ...cell, slots: compacted };
+                                return { ...cell, slots: [null, ...compacted] };
                             }
                         }));
 
@@ -1186,12 +1275,12 @@
                                 newSlots.splice(draggedSlot.slotIndex, 1);
                                 newSlots.push(null);
 
-                                // Compact
-                                const compacted = newSlots.filter(slot => slot !== null);
+                                // Compact slots 1-53, preserve slot 0
+                                const compacted = newSlots.slice(1).filter(slot => slot !== null);
 
                                 // Calculate adjusted insert index
-                                let adjustedIndex = slotIndex;
-                                if (draggedSlot.slotIndex < slotIndex) {
+                                let adjustedIndex = Math.max(0, slotIndex - 1);
+                                if (draggedSlot.slotIndex > 0 && draggedSlot.slotIndex < slotIndex) {
                                     adjustedIndex--;
                                 }
                                 adjustedIndex = Math.max(0, Math.min(adjustedIndex, compacted.length));
@@ -1200,37 +1289,38 @@
                                 compacted.splice(adjustedIndex, 0, draggedSlot.item);
 
                                 // Pad with nulls
-                                while (compacted.length < 50) {
+                                while (compacted.length < 53) {
                                     compacted.push(null);
                                 }
 
-                                return { ...cell, slots: compacted };
+                                return { ...cell, slots: [null, ...compacted] };
                             } else if (cell.id === draggedSlot.cellId) {
                                 // Source cell - remove item and compact
                                 newSlots[draggedSlot.slotIndex] = null;
-                                const compacted = newSlots.filter(slot => slot !== null);
-                                while (compacted.length < 50) {
+                                const compacted = newSlots.slice(1).filter(slot => slot !== null);
+                                while (compacted.length < 53) {
                                     compacted.push(null);
                                 }
-                                return { ...cell, slots: compacted };
+                                return { ...cell, slots: [null, ...compacted] };
                             } else if (cell.id === cellId) {
                                 // Target cell - insert item
-                                const compacted = newSlots.filter(slot => slot !== null);
+                                const compacted = newSlots.slice(1).filter(slot => slot !== null);
 
-                                // Insert at target position
-                                compacted.splice(slotIndex, 0, draggedSlot.item);
+                                // Insert at target position (adjusted for slot 0)
+                                const adjustedSlotIndex = Math.max(0, slotIndex - 1);
+                                compacted.splice(adjustedSlotIndex, 0, draggedSlot.item);
 
-                                // Trim if over 50
-                                if (compacted.length > 50) {
-                                    compacted.length = 50;
+                                // Trim if over 53
+                                if (compacted.length > 53) {
+                                    compacted.length = 53;
                                 }
 
                                 // Pad with nulls
-                                while (compacted.length < 50) {
+                                while (compacted.length < 53) {
                                     compacted.push(null);
                                 }
 
-                                return { ...cell, slots: compacted };
+                                return { ...cell, slots: [null, ...compacted] };
                             }
 
                             return cell;
@@ -1240,6 +1330,268 @@
 
                 setDraggedItem(null);
                 setDraggedSlot(null);
+            };
+
+            // Calculate redstone signal strength for a container
+            // Based on: floor(14/inv_size * reduce(items, (item:1)/min(64, stack_limit(item:0)) + _a, 0) + min(1, length(items)))
+            const calculateSignalStrength = (slots) => {
+                const invSize = 54;
+                const items = slots.filter(item => item !== null);
+
+                if (items.length === 0) return 0;
+
+                const fillSum = items.reduce((sum, item) => {
+                    const stackLimit = Math.min(64, item.stack_size || 64);
+                    const quantity = item.quantity || 1;
+                    return sum + (quantity / stackLimit);
+                }, 0);
+
+                return Math.floor((14 / invSize) * fillSum + Math.min(1, items.length));
+            };
+
+            // Optimize container to ensure adding one more item increments signal strength
+            const optimizeForRedstone = (slots, rejectedItemIds = []) => {
+                const invSize = 54;
+                const items = slots.slice(1).filter(item => item !== null); // Skip slot 0
+
+                if (items.length === 0) return slots;
+
+                // Create working copy with quantities and track original indices
+                let optimizedSlots = slots.map((item, idx) => item ? { ...item, quantity: item.quantity || 1, originalIndex: idx } : null);
+
+                // Calculate current signal strength
+                let currentSignal = calculateSignalStrength(optimizedSlots);
+
+                // Group items by stack size
+                const unstackables = items.filter(item => (item.stack_size || 64) === 1);
+                const sixteenStackables = items.filter(item => (item.stack_size || 64) === 16);
+                const sixtyFourStackables = items.filter(item => (item.stack_size || 64) === 64);
+
+                const hasUnstackable = unstackables.length > 0;
+                const hasSixteen = sixteenStackables.length > 0;
+                const hasSixtyFour = sixtyFourStackables.length > 0;
+
+                // Track which slots have duplicated unstackables
+                const duplicatedSlots = [];
+
+                // Strategy 1: Duplicate unstackables if available
+                if (hasUnstackable) {
+                    // Find a common unstackable to duplicate (excluding rejected items)
+                    const targetUnstackable = unstackables
+                        .filter(item => !rejectedItemIds.includes(item.id))
+                        .sort((a, b) => {
+                            const rarityOrder = { common: 0, uncommon: 1, rare: 2, epic: 3 };
+                            return (rarityOrder[a.rarity] || 0) - (rarityOrder[b.rarity] || 0);
+                        })[0];
+
+                    // Fill empty slots with this unstackable until signal increments (if we found one)
+                    if (targetUnstackable) {
+                        for (let i = 1; i < optimizedSlots.length; i++) {
+                            if (optimizedSlots[i] === null) {
+                                optimizedSlots[i] = { ...targetUnstackable, quantity: 1, originalIndex: -1 };
+                                duplicatedSlots.push(i);
+                                const newSignal = calculateSignalStrength(optimizedSlots);
+                                if (newSignal > currentSignal) {
+                                    // Remove this last one so we're at the threshold
+                                    optimizedSlots[i] = null;
+                                    duplicatedSlots.pop();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Strategy 2: Increment 16-stackables (skip rejected items)
+                if (hasSixteen) {
+                    while (true) {
+                        let incremented = false;
+                        for (let i = 1; i < optimizedSlots.length; i++) {
+                            if (optimizedSlots[i] &&
+                                (optimizedSlots[i].stack_size || 64) === 16 &&
+                                !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                                if (optimizedSlots[i].quantity < 16) {
+                                    optimizedSlots[i].quantity++;
+                                    const newSignal = calculateSignalStrength(optimizedSlots);
+                                    if (newSignal > currentSignal) {
+                                        optimizedSlots[i].quantity--;
+                                        break;
+                                    }
+                                    incremented = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!incremented) break;
+                    }
+                }
+
+                // Strategy 3: Increment 64-stackables (skip rejected items)
+                if (hasSixtyFour) {
+                    while (true) {
+                        let incremented = false;
+                        for (let i = 1; i < optimizedSlots.length; i++) {
+                            if (optimizedSlots[i] &&
+                                (optimizedSlots[i].stack_size || 64) === 64 &&
+                                !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                                if (optimizedSlots[i].quantity < 64) {
+                                    optimizedSlots[i].quantity++;
+                                    const newSignal = calculateSignalStrength(optimizedSlots);
+                                    if (newSignal > currentSignal) {
+                                        optimizedSlots[i].quantity--;
+                                        break;
+                                    }
+                                    incremented = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!incremented) break;
+                    }
+                }
+
+                // Strategy 4: Check if all existing stacks are maxed out
+                // Only duplicate stacks if we can't reach threshold by incrementing existing items
+                let finalSignal = calculateSignalStrength(optimizedSlots);
+                if (finalSignal === currentSignal) {
+                    // Check if all non-rejected items are at their stack limits
+                    let allMaxed = true;
+                    for (let i = 1; i < optimizedSlots.length; i++) {
+                        if (optimizedSlots[i] && !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                            const stackLimit = optimizedSlots[i].stack_size || 64;
+                            if (optimizedSlots[i].quantity < stackLimit) {
+                                allMaxed = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Only duplicate if all existing stacks are maxed
+                    if (allMaxed) {
+                        // Try duplicating stackable items into empty slots
+                        const availableItems = optimizedSlots.slice(1).filter(item =>
+                            item !== null && !rejectedItemIds.includes(item.id)
+                        );
+
+                        // Sort by rarity (prefer common items) and stack size (prefer smaller stacks)
+                        availableItems.sort((a, b) => {
+                            const rarityOrder = { common: 0, uncommon: 1, rare: 2, epic: 3 };
+                            const rarityA = rarityOrder[a.rarity] || 0;
+                            const rarityB = rarityOrder[b.rarity] || 0;
+
+                            if (rarityA !== rarityB) return rarityA - rarityB;
+
+                            const stackA = a.stack_size || 64;
+                            const stackB = b.stack_size || 64;
+                            return stackA - stackB;
+                        });
+
+                        // Try duplicating items until adding a full stack would increment signal
+                        for (const itemToDuplicate of availableItems) {
+                            for (let i = 1; i < optimizedSlots.length; i++) {
+                                if (optimizedSlots[i] === null) {
+                                    optimizedSlots[i] = { ...itemToDuplicate, originalIndex: -1 };
+                                    duplicatedSlots.push(i);
+                                    const newSignal = calculateSignalStrength(optimizedSlots);
+                                    if (newSignal > currentSignal) {
+                                        // Keep this stack but set quantity to 1, then Strategy 5 will fine-tune it
+                                        optimizedSlots[i].quantity = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Check if we've reached the threshold
+                            if (calculateSignalStrength(optimizedSlots) > currentSignal) {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Strategy 5: Increment quantities until adding ONE item increments signal
+                    currentSignal = calculateSignalStrength(optimizedSlots);
+                    let reachedThreshold = false;
+                    while (true) {
+                        let incremented = false;
+                        for (let i = 1; i < optimizedSlots.length; i++) {
+                            if (optimizedSlots[i] && !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                                const stackLimit = optimizedSlots[i].stack_size || 64;
+                                if (optimizedSlots[i].quantity < stackLimit) {
+                                    optimizedSlots[i].quantity++;
+                                    const newSignal = calculateSignalStrength(optimizedSlots);
+                                    if (newSignal > currentSignal) {
+                                        optimizedSlots[i].quantity--;
+                                        // We're done - adding one more item would increment signal
+                                        reachedThreshold = true;
+                                        break;
+                                    }
+                                    incremented = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!incremented || reachedThreshold) break;
+                    }
+                }
+
+                // Now reorganize: unadjusted items first, then adjusted items sorted
+                const unadjusted = [];
+                const adjustedUnstackables = [];
+                const adjustedStackables = [];
+
+                // Find the original unstackable that was duplicated (if any)
+                let originalUnstackableItem = null;
+                if (duplicatedSlots.length > 0) {
+                    // Find the original (not duplicated) unstackable with same id
+                    for (let i = 1; i < optimizedSlots.length; i++) {
+                        if (optimizedSlots[i] !== null &&
+                            !duplicatedSlots.includes(i) &&
+                            (optimizedSlots[i].stack_size || 64) === 1) {
+                            // Check if this unstackable matches the duplicated ones
+                            const firstDup = optimizedSlots[duplicatedSlots[0]];
+                            if (firstDup && optimizedSlots[i].id === firstDup.id) {
+                                originalUnstackableItem = { item: optimizedSlots[i], index: i };
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                for (let i = 1; i < optimizedSlots.length; i++) {
+                    if (optimizedSlots[i] !== null) {
+                        const isDuplicated = duplicatedSlots.includes(i);
+                        const isOriginalOfDuplicated = originalUnstackableItem && originalUnstackableItem.index === i;
+                        const isAdjusted = optimizedSlots[i].quantity > 1 || isDuplicated || isOriginalOfDuplicated;
+                        const stackSize = optimizedSlots[i].stack_size || 64;
+
+                        // Mark item as adjusted
+                        optimizedSlots[i].isAdjusted = isAdjusted;
+
+                        if (isAdjusted) {
+                            if (stackSize === 1) {
+                                adjustedUnstackables.push(optimizedSlots[i]);
+                            } else {
+                                adjustedStackables.push(optimizedSlots[i]);
+                            }
+                        } else {
+                            unadjusted.push(optimizedSlots[i]);
+                        }
+                    }
+                }
+
+                // Sort stackables by absolute quantity only (largest quantity at the back)
+                // 8/16 should come after 3/64 since 8 > 3
+                adjustedStackables.sort((a, b) => a.quantity - b.quantity);
+
+                // Adjusted unstackables stay together (original + duplicates)
+                // They go to the front of the adjusted section
+
+                // Reconstruct: [null (slot 0), ...unadjusted, ...adjustedUnstackables, ...adjustedStackables, ...nulls]
+                const result = [null, ...unadjusted, ...adjustedUnstackables, ...adjustedStackables];
+                while (result.length < 54) {
+                    result.push(null);
+                }
+
+                return result;
             };
 
             // Calculate HSL color distance between two items
@@ -1300,12 +1652,13 @@
                         remaining.splice(closestIndex, 1);
                     }
 
-                    // Pad with nulls to maintain 50 slots
-                    while (sorted.length < 50) {
+                    // Pad with nulls to maintain 53 usable slots
+                    while (sorted.length < 53) {
                         sorted.push(null);
                     }
 
-                    return { ...cell, slots: sorted };
+                    // Reconstruct with slot 0 as null
+                    return { ...cell, slots: [null, ...sorted] };
                 }));
             };
 
@@ -1553,12 +1906,13 @@
                         });
                     }
 
-                    // Pad with nulls to maintain 50 slots
-                    while (sorted.length < 50) {
+                    // Pad with nulls to maintain 53 usable slots
+                    while (sorted.length < 53) {
                         sorted.push(null);
                     }
 
-                    return { ...cell, slots: sorted };
+                    // Reconstruct with slot 0 as null
+                    return { ...cell, slots: [null, ...sorted] };
                 }));
             };
 
@@ -1645,12 +1999,13 @@
                         });
                     }
 
-                    // Pad with nulls to maintain 50 slots
-                    while (sorted.length < 50) {
+                    // Pad with nulls to maintain 53 usable slots
+                    while (sorted.length < 53) {
                         sorted.push(null);
                     }
 
-                    return { ...cell, slots: sorted };
+                    // Reconstruct with slot 0 as null
+                    return { ...cell, slots: [null, ...sorted] };
                 }));
             };
             const clearSlot = (cellId, slotIndex) => {
@@ -1684,13 +2039,18 @@
                             const newSlots = [...cell.slots];
                             // Remove the item at the slot index
                             newSlots.splice(slotIndex, 1);
-                            // Add null at the end to maintain 50 slots
+                            // Add null at the end to maintain 54 slots
                             newSlots.push(null);
                             return { ...cell, slots: newSlots };
                         }
                         return cell;
                     }));
                 }
+            };
+
+            // Reject an item from being used for fill level adjustment
+            const rejectFillLevelItem = (itemId) => {
+                setRejectedItems([...rejectedItems, itemId]);
             };
 
             // Cell drag handlers
@@ -1897,6 +2257,15 @@
                                 <div className="px-3 py-1.5 bg-stone-900 rounded text-xs text-stone-300 whitespace-nowrap">
                                     Cells: {cells.length}
                                 </div>
+
+                                {/* Display Mode Toggle */}
+                                <button
+                                    onClick={() => setDisplayMode(!displayMode)}
+                                    className={`px-3 py-1.5 rounded transition-colors whitespace-nowrap text-xs ${displayMode ? 'bg-red-600 text-white' : 'bg-stone-800 text-stone-300 hover:bg-stone-700'}`}
+                                    title={displayMode ? "Redstone Mode: Optimized for signal strength" : "Normal Mode"}
+                                >
+                                    {displayMode ? 'Redstone Mode' : 'Normal Mode'}
+                                </button>
                             </div>
 
                             {/* Advanced Filters Panel */}
@@ -2001,6 +2370,83 @@
                                             </div>
                                         </div>
 
+                                        {/* Middle: Stack Size Filter */}
+                                        <div className="mt-2">
+                                            <div className="text-sm font-semibold text-amber-400 mb-1">Stack Size</div>
+                                            <div className="flex flex-col gap-2">
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={stackSizeFilters[1]}
+                                                        onChange={(e) => setStackSizeFilters({ ...stackSizeFilters, 1: e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">Unstackable</span>
+                                                </label>
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={stackSizeFilters[16]}
+                                                        onChange={(e) => setStackSizeFilters({ ...stackSizeFilters, 16: e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">16-stackable</span>
+                                                </label>
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={stackSizeFilters[64]}
+                                                        onChange={(e) => setStackSizeFilters({ ...stackSizeFilters, 64: e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">64-stackable</span>
+                                                </label>
+                                            </div>
+                                        </div>
+
+                                        {/* Middle: Rarity Filter */}
+                                        <div className="mt-2">
+                                            <div className="text-sm font-semibold text-amber-400 mb-1">Rarity</div>
+                                            <div className="flex flex-col gap-2">
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={rarityFilters["common"]}
+                                                        onChange={(e) => setRarityFilters({ ...rarityFilters, "common": e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">Common</span>
+                                                </label>
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={rarityFilters["uncommon"]}
+                                                        onChange={(e) => setRarityFilters({ ...rarityFilters, "uncommon": e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">Uncommon</span>
+                                                </label>
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={rarityFilters["rare"]}
+                                                        onChange={(e) => setRarityFilters({ ...rarityFilters, "rare": e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">Rare</span>
+                                                </label>
+                                                <label className="flex items-center gap-2 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={rarityFilters["epic"]}
+                                                        onChange={(e) => setRarityFilters({ ...rarityFilters, "epic": e.target.checked })}
+                                                        className="w-4 h-4 cursor-pointer accent-amber-500"
+                                                    />
+                                                    <span className="text-sm text-stone-300">Epic</span>
+                                                </label>
+                                            </div>
+                                        </div>
+
                                         {/* Right side: Color Picker */}
                                         <div className="flex-1 flex flex-col items-center">
                                             <div className="text-sm font-semibold text-amber-400 mb-2">Color Filter</div>
@@ -2023,29 +2469,34 @@
                         <div className="flex flex-wrap gap-6">
                             {cells.map((cell, cellIndex) => {
                                 const isDragOverThisCell = dragOverCell === cell.id;
+                                const displaySlots = displayMode ? optimizeForRedstone(cell.slots, rejectedItems) : cell.slots;
+                                const signalStrength = displayMode ? calculateSignalStrength(displaySlots) : null;
+
                                 return (
                                 <div
                                     key={cell.id}
                                     className={`bg-stone-900 border-2 rounded-lg p-4 cell-container transition-all ${
-                                        isDragOverThisCell ? 'border-amber-500' : 'border-stone-700'
+                                        isDragOverThisCell ? 'border-amber-500' : displayMode ? 'border-red-700' : 'border-stone-700'
                                     }`}
                                     draggable={false}
                                     onDragOver={(e) => handleCellDragOver(e, cell.id)}
                                     onDragLeave={(e) => handleCellDragLeave(e, cell.id)}
                                     onDrop={(e) => handleCellDrop(e, cell.id)}
                                 >
-                                    <div 
+                                    <div
                                         className="flex justify-between items-center mb-3 min-w-max cell-drag-handle"
-                                        draggable
-                                        onDragStart={(e) => handleCellDragStart(e, cell.id)}
-                                        onDragEnd={handleCellDragEnd}
+                                        draggable={!displayMode}
+                                        onDragStart={(e) => !displayMode && handleCellDragStart(e, cell.id)}
+                                        onDragEnd={!displayMode ? handleCellDragEnd : undefined}
                                     >
-                                        <div className="flex items-center gap-2 cursor-grab active:cursor-grabbing">
+                                        <div className={`flex items-center gap-2 ${displayMode ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}`}>
                                             <GripIcon />
                                             <span className="text-sm text-stone-400">
-                                                {cell.slots.filter(s => s !== null).length}/50
+                                                {cell.slots.filter(s => s !== null).length}/53
+                                                {displayMode && <span className="ml-2 text-red-400">SS: {signalStrength}</span>}
                                             </span>
                                         </div>
+                                        {!displayMode && (
                                         <div className="flex items-center gap-2">
                                             <button
                                                 onClick={(e) => {
@@ -2085,27 +2536,33 @@
                                                 <XIcon />
                                             </button>
                                         </div>
+                                        )}
                                     </div>
 
-                                    {/* 5x10 Grid */}
+                                    {/* 6x9 Grid (54 slots, first slot reserved) */}
                                     <div
-                                        className="inline-grid grid-cols-10 gap-1 bg-stone-800 p-2 rounded"
+                                        className="inline-grid grid-cols-9 gap-1 bg-stone-800 p-2 rounded"
                                         style={draggedCell ? { pointerEvents: 'none' } : {}}
                                     >
-                                        {cell.slots.map((slot, slotIndex) => {
+                                        {displaySlots.map((slot, slotIndex) => {
                                             const slotKey = `${cell.id}-${slotIndex}`;
                                             const isDragOver = dragOverSlot === slotKey;
                                             const isSelected = selectedSlots.some(s => s.cellId === cell.id && s.slotIndex === slotIndex);
+                                            const isReserved = slotIndex === 0; // First slot is reserved
+                                            const quantity = slot?.quantity || 1;
+                                            const isAdjusted = displayMode && slot?.isAdjusted;
+
                                             return (
                                                 <div
                                                     key={slotIndex}
-                                                    draggable={!!slot}
-                                                    onDragStart={(e) => slot && handleItemDragStart(e, slot, { type: 'slot', cellId: cell.id, slotIndex })}
-                                                    onDragEnd={handleItemDragEnd}
-                                                    onDragOver={(e) => handleItemDragOver(e, cell.id, slotIndex)}
-                                                    onDragLeave={handleItemDragLeave}
-                                                    onDrop={(e) => handleItemDrop(e, cell.id, slotIndex)}
+                                                    draggable={!displayMode && !isReserved && !!slot}
+                                                    onDragStart={(e) => !displayMode && !isReserved && slot && handleItemDragStart(e, slot, { type: 'slot', cellId: cell.id, slotIndex })}
+                                                    onDragEnd={!displayMode && !isReserved ? handleItemDragEnd : undefined}
+                                                    onDragOver={(e) => !displayMode && !isReserved && handleItemDragOver(e, cell.id, slotIndex)}
+                                                    onDragLeave={!displayMode && !isReserved ? handleItemDragLeave : undefined}
+                                                    onDrop={(e) => !displayMode && !isReserved && handleItemDrop(e, cell.id, slotIndex)}
                                                     onClick={(e) => {
+                                                        if (displayMode || isReserved) return;
                                                         e.stopPropagation();
                                                         if (slot) {
                                                             handleSlotClick(e, cell.id, slotIndex, slot);
@@ -2114,27 +2571,52 @@
                                                             handleBackgroundClick();
                                                         }
                                                     }}
-                                                    className={`w-12 h-12 bg-stone-700 border rounded flex items-center justify-center transition-colors relative group ${
-                                                        slot ? 'cursor-grab active:cursor-grabbing' : ''
-                                                    } ${isDragOver ? 'drag-over-slot' : isSelected ? 'border-2 border-blue-400 bg-blue-900 bg-opacity-30' : 'border-stone-600 hover:border-amber-600'}`}
-                                                    title={slot ? slot.name : ''}
+                                                    className={`w-12 h-12 border rounded flex items-center justify-center transition-colors relative group ${
+                                                        isReserved
+                                                            ? 'bg-stone-900 border-stone-800 cursor-not-allowed opacity-50'
+                                                            : displayMode
+                                                            ? `bg-stone-700 ${slot ? 'cursor-default' : ''} ${isAdjusted ? 'border-2 border-red-500 shadow-red-500/50 shadow-md' : 'border-stone-600'}`
+                                                            : `bg-stone-700 ${slot ? 'cursor-grab active:cursor-grabbing' : ''} ${isDragOver ? 'drag-over-slot' : isSelected ? 'border-2 border-blue-400 bg-blue-900 bg-opacity-30' : 'border-stone-600 hover:border-amber-600'}`
+                                                    }`}
+                                                    title={isReserved ? 'Reserved slot' : (slot ? slot.name : '')}
                                                 >
-                                                    {slot ? (
+                                                    {isReserved ? (
+                                                        <div className="text-stone-700 text-xs pointer-events-none">—</div>
+                                                    ) : slot ? (
                                                         <>
                                                             <img
                                                                 src={slot.sprite}
                                                                 alt={slot.name}
                                                                 className="w-10 h-10 pixelated pointer-events-none"
                                                             />
-                                                            <button
-                                                                onClick={(e) => {
-                                                                    e.stopPropagation();
-                                                                    clearSlot(cell.id, slotIndex);
-                                                                }}
-                                                                className="absolute top-0 right-0 bg-red-600 text-white rounded-bl text-xs w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                                                            >
-                                                                ×
-                                                            </button>
+                                                            {displayMode && quantity > 1 && (
+                                                                <div className="absolute bottom-0 right-0 bg-stone-900 text-white text-xs px-1 rounded-tl pointer-events-none font-bold">
+                                                                    {quantity}
+                                                                </div>
+                                                            )}
+                                                            {!displayMode && (
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        clearSlot(cell.id, slotIndex);
+                                                                    }}
+                                                                    className="absolute top-0 right-0 bg-red-600 text-white rounded-bl text-xs w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                                                                >
+                                                                    ×
+                                                                </button>
+                                                            )}
+                                                            {isAdjusted && (
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        rejectFillLevelItem(slot.id);
+                                                                    }}
+                                                                    className="absolute top-0 left-0 bg-orange-600 text-white rounded-br text-xs w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                                                                    title="Reject this item for fill level adjustment"
+                                                                >
+                                                                    ⊘
+                                                                </button>
+                                                            )}
                                                         </>
                                                     ) : (
                                                         <div className="text-stone-600 text-xs pointer-events-none">+</div>
