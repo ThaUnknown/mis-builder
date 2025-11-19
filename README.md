@@ -1,2 +1,2 @@
-# the-cubicmetre.github.io
-Minecraft Item Set Builder
+# Minecraft Item Set Builder
+
