@@ -458,7 +458,6 @@
             const [lumRange, setLumRange] = useState([0, 100]);
             const [moveAllMode, setMoveAllMode] = useState(false);
             const [displayMode, setDisplayMode] = useState(false); // false = normal, true = redstone optimization
-            const [rejectedItems, setRejectedItems] = useState([]); // Array of item IDs rejected from fill level adjustment
             const [playerStats, setPlayerStats] = useState(() => {
                 const saved = localStorage.getItem('minecraftBuilder_playerStats');
                 return saved ? JSON.parse(saved) : null;
@@ -1256,6 +1255,30 @@
                 e.stopPropagation(); // Stop event from bubbling to cell drop handler
                 setDragOverSlot(null);
 
+                // Handle displayMode substitution
+                if (displayMode && draggedSlot) {
+                    const targetCell = cells.find(c => c.id === cellId);
+
+                    // Only allow substitution within the same cell
+                    if (draggedSlot.cellId === cellId) {
+                        const displaySlots = optimizeForRedstone(targetCell.slots);
+                        const targetItem = displaySlots[slotIndex];
+
+                        // Check if dropping on an adjusted item
+                        if (targetItem && targetItem.isAdjusted) {
+                            // Pass display indices, not actual slot data
+                            substituteAdjustedItem(cellId, slotIndex, draggedSlot.slotIndex);
+                            setDraggedItem(null);
+                            setDraggedSlot(null);
+                            return;
+                        }
+                    }
+                    // If not substituting, don't allow any other drops in displayMode
+                    setDraggedItem(null);
+                    setDraggedSlot(null);
+                    return;
+                }
+
                 saveToHistory(); // Save state before making changes
 
                 const targetSlot = cells.find(c => c.id === cellId).slots[slotIndex];
@@ -1568,51 +1591,78 @@
             };
 
             // Optimize container to ensure adding one more item increments signal strength
-            const optimizeForRedstone = (slots, rejectedItemIds = []) => {
+            const optimizeForRedstone = (slots) => {
                 const invSize = 54;
                 const items = slots.slice(1).filter(item => item !== null); // Skip slot 0
 
                 if (items.length === 0) return slots;
 
-                // Create working copy with quantities and track original indices
+                // Always use the simpler logic: items are adjusted if they have quantity > 1 OR multiple instances exist
                 let optimizedSlots = slots.map((item, idx) => item ? { ...item, quantity: item.quantity || 1, originalIndex: idx } : null);
-
-                // Calculate current signal strength
                 let currentSignal = calculateSignalStrength(optimizedSlots);
 
-                // Group items by stack size
-                const unstackables = items.filter(item => (item.stack_size || 64) === 1);
-                const sixteenStackables = items.filter(item => (item.stack_size || 64) === 16);
-                const sixtyFourStackables = items.filter(item => (item.stack_size || 64) === 64);
+                // Count occurrences of each item ID
+                const itemCounts = {};
+                for (let i = 1; i < optimizedSlots.length; i++) {
+                    if (optimizedSlots[i]) {
+                        itemCounts[optimizedSlots[i].id] = (itemCounts[optimizedSlots[i].id] || 0) + 1;
+                    }
+                }
 
-                const hasUnstackable = unstackables.length > 0;
-                const hasSixteen = sixteenStackables.length > 0;
-                const hasSixtyFour = sixtyFourStackables.length > 0;
+                // Mark items that are already adjusted (have quantity > 1 OR multiple instances)
+                // These are items we want to preserve from substitution
+                for (let i = 1; i < optimizedSlots.length; i++) {
+                    if (optimizedSlots[i]) {
+                        const hasMultipleInstances = itemCounts[optimizedSlots[i].id] > 1;
+                        const hasQuantity = (optimizedSlots[i].quantity || 1) > 1;
+                        if (hasQuantity || hasMultipleInstances) {
+                            optimizedSlots[i].forceAdjusted = true;
+                        }
+                    }
+                }
 
-                // Track which slots have duplicated unstackables
-                const duplicatedSlots = [];
+                // Check if we have any items with quantity adjustments (not just duplicates)
+                const hasQuantityAdjustments = optimizedSlots.some(item => item && (item.quantity || 1) > 1);
 
-                // Strategy 1: Duplicate unstackables if available
-                if (hasUnstackable) {
-                    // Find a common unstackable to duplicate (excluding rejected items)
+                // Check if we have any user-substituted items (from manual drag-drop substitution)
+                const hasUserSubstituted = optimizedSlots.some(item => item && item.userSubstituted === true);
+
+                // If we don't have quantity adjustments AND no user substitutions, mark ALL items as candidates
+                if (!hasQuantityAdjustments && !hasUserSubstituted) {
+                    // Mark ALL items as candidates for adjustment
+                    for (let i = optimizedSlots.length - 1; i >= 1; i--) {
+                        if (optimizedSlots[i]) {
+                            optimizedSlots[i].forceAdjusted = true;
+                        }
+                    }
+                }
+                // If we have user substitutions, only use items with forceAdjusted (preserves user choices)
+
+                // Find items that should be adjusted
+                const forcedItems = optimizedSlots.filter(item => item && item.forceAdjusted === true);
+                const hasUnstackable = forcedItems.some(item => (item.stack_size || 64) === 1);
+                const hasSixteen = forcedItems.some(item => (item.stack_size || 64) === 16);
+                const hasSixtyFour = forcedItems.some(item => (item.stack_size || 64) === 64);
+
+                // Strategy 1: Duplicate unstackables if available (only if no quantity adjustments exist)
+                if (hasUnstackable && !hasQuantityAdjustments) {
+                    // Find the most common unstackable to duplicate (prefer lower rarity)
+                    const unstackables = forcedItems.filter(item => (item.stack_size || 64) === 1);
                     const targetUnstackable = unstackables
-                        .filter(item => !rejectedItemIds.includes(item.id))
                         .sort((a, b) => {
                             const rarityOrder = { common: 0, uncommon: 1, rare: 2, epic: 3 };
                             return (rarityOrder[a.rarity] || 0) - (rarityOrder[b.rarity] || 0);
                         })[0];
 
-                    // Fill empty slots with this unstackable until signal increments (if we found one)
                     if (targetUnstackable) {
+                        // Fill empty slots with this unstackable until signal increments
                         for (let i = 1; i < optimizedSlots.length; i++) {
                             if (optimizedSlots[i] === null) {
-                                optimizedSlots[i] = { ...targetUnstackable, quantity: 1, originalIndex: -1 };
-                                duplicatedSlots.push(i);
+                                optimizedSlots[i] = { ...targetUnstackable, quantity: 1, originalIndex: -1, isDuplicate: true, forceAdjusted: true };
                                 const newSignal = calculateSignalStrength(optimizedSlots);
                                 if (newSignal > currentSignal) {
                                     // Remove this last one so we're at the threshold
                                     optimizedSlots[i] = null;
-                                    duplicatedSlots.pop();
                                     break;
                                 }
                             }
@@ -1620,14 +1670,12 @@
                     }
                 }
 
-                // Strategy 2: Increment 16-stackables (skip rejected items)
+                // Strategy 2: Increment 16-stackables from the END
                 if (hasSixteen) {
                     while (true) {
                         let incremented = false;
-                        for (let i = 1; i < optimizedSlots.length; i++) {
-                            if (optimizedSlots[i] &&
-                                (optimizedSlots[i].stack_size || 64) === 16 &&
-                                !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                        for (let i = optimizedSlots.length - 1; i >= 1; i--) {
+                            if (optimizedSlots[i] && optimizedSlots[i].forceAdjusted === true && (optimizedSlots[i].stack_size || 64) === 16) {
                                 if (optimizedSlots[i].quantity < 16) {
                                     optimizedSlots[i].quantity++;
                                     const newSignal = calculateSignalStrength(optimizedSlots);
@@ -1644,14 +1692,12 @@
                     }
                 }
 
-                // Strategy 3: Increment 64-stackables (skip rejected items)
+                // Strategy 3: Increment 64-stackables from the END
                 if (hasSixtyFour) {
                     while (true) {
                         let incremented = false;
-                        for (let i = 1; i < optimizedSlots.length; i++) {
-                            if (optimizedSlots[i] &&
-                                (optimizedSlots[i].stack_size || 64) === 64 &&
-                                !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                        for (let i = optimizedSlots.length - 1; i >= 1; i--) {
+                            if (optimizedSlots[i] && optimizedSlots[i].forceAdjusted === true && (optimizedSlots[i].stack_size || 64) === 64) {
                                 if (optimizedSlots[i].quantity < 64) {
                                     optimizedSlots[i].quantity++;
                                     const newSignal = calculateSignalStrength(optimizedSlots);
@@ -1668,146 +1714,125 @@
                     }
                 }
 
-                // Strategy 4: Check if all existing stacks are maxed out
-                // Only duplicate stacks if we can't reach threshold by incrementing existing items
-                let finalSignal = calculateSignalStrength(optimizedSlots);
-                if (finalSignal === currentSignal) {
-                    // Check if all non-rejected items are at their stack limits
-                    let allMaxed = true;
-                    for (let i = 1; i < optimizedSlots.length; i++) {
-                        if (optimizedSlots[i] && !rejectedItemIds.includes(optimizedSlots[i].id)) {
-                            const stackLimit = optimizedSlots[i].stack_size || 64;
-                            if (optimizedSlots[i].quantity < stackLimit) {
-                                allMaxed = false;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Only duplicate if all existing stacks are maxed
-                    if (allMaxed) {
-                        // Try duplicating stackable items into empty slots
-                        const availableItems = optimizedSlots.slice(1).filter(item =>
-                            item !== null && !rejectedItemIds.includes(item.id)
-                        );
-
-                        // Sort by rarity (prefer common items) and stack size (prefer smaller stacks)
-                        availableItems.sort((a, b) => {
-                            const rarityOrder = { common: 0, uncommon: 1, rare: 2, epic: 3 };
-                            const rarityA = rarityOrder[a.rarity] || 0;
-                            const rarityB = rarityOrder[b.rarity] || 0;
-
-                            if (rarityA !== rarityB) return rarityA - rarityB;
-
-                            const stackA = a.stack_size || 64;
-                            const stackB = b.stack_size || 64;
-                            return stackA - stackB;
-                        });
-
-                        // Try duplicating items until adding a full stack would increment signal
-                        for (const itemToDuplicate of availableItems) {
-                            for (let i = 1; i < optimizedSlots.length; i++) {
-                                if (optimizedSlots[i] === null) {
-                                    optimizedSlots[i] = { ...itemToDuplicate, originalIndex: -1 };
-                                    duplicatedSlots.push(i);
-                                    const newSignal = calculateSignalStrength(optimizedSlots);
-                                    if (newSignal > currentSignal) {
-                                        // Keep this stack but set quantity to 1, then Strategy 5 will fine-tune it
-                                        optimizedSlots[i].quantity = 1;
-                                        break;
-                                    }
-                                }
-                            }
-                            // Check if we've reached the threshold
-                            if (calculateSignalStrength(optimizedSlots) > currentSignal) {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Strategy 5: Increment quantities until adding ONE item increments signal
-                    currentSignal = calculateSignalStrength(optimizedSlots);
-                    let reachedThreshold = false;
-                    while (true) {
-                        let incremented = false;
+                // Strategy 4: Duplicate stackables if needed (only if no quantity adjustments exist)
+                // This runs if all existing stacks are maxed and we still haven't reached threshold
+                if (!hasQuantityAdjustments) {
+                    let finalSignal = calculateSignalStrength(optimizedSlots);
+                    if (finalSignal === currentSignal) {
+                        // Check if all items are at their stack limits
+                        let allMaxed = true;
                         for (let i = 1; i < optimizedSlots.length; i++) {
-                            if (optimizedSlots[i] && !rejectedItemIds.includes(optimizedSlots[i].id)) {
+                            if (optimizedSlots[i] && optimizedSlots[i].forceAdjusted === true) {
                                 const stackLimit = optimizedSlots[i].stack_size || 64;
                                 if (optimizedSlots[i].quantity < stackLimit) {
-                                    optimizedSlots[i].quantity++;
-                                    const newSignal = calculateSignalStrength(optimizedSlots);
-                                    if (newSignal > currentSignal) {
-                                        optimizedSlots[i].quantity--;
-                                        // We're done - adding one more item would increment signal
-                                        reachedThreshold = true;
-                                        break;
-                                    }
-                                    incremented = true;
+                                    allMaxed = false;
                                     break;
                                 }
                             }
                         }
-                        if (!incremented || reachedThreshold) break;
-                    }
-                }
 
-                // Now reorganize: unadjusted items first, then adjusted items sorted
-                const unadjusted = [];
-                const adjustedUnstackables = [];
-                const adjustedStackables = [];
+                        // Only duplicate if all existing stacks are maxed
+                        if (allMaxed) {
+                            // Try duplicating items (prefer lower rarity and smaller stack sizes)
+                            const availableItems = forcedItems
+                                .filter(item => item !== null)
+                                .sort((a, b) => {
+                                    const rarityOrder = { common: 0, uncommon: 1, rare: 2, epic: 3 };
+                                    const rarityA = rarityOrder[a.rarity] || 0;
+                                    const rarityB = rarityOrder[b.rarity] || 0;
+                                    if (rarityA !== rarityB) return rarityA - rarityB;
+                                    const stackA = a.stack_size || 64;
+                                    const stackB = b.stack_size || 64;
+                                    return stackA - stackB;
+                                });
 
-                // Find the original unstackable that was duplicated (if any)
-                let originalUnstackableItem = null;
-                if (duplicatedSlots.length > 0) {
-                    // Find the original (not duplicated) unstackable with same id
-                    for (let i = 1; i < optimizedSlots.length; i++) {
-                        if (optimizedSlots[i] !== null &&
-                            !duplicatedSlots.includes(i) &&
-                            (optimizedSlots[i].stack_size || 64) === 1) {
-                            // Check if this unstackable matches the duplicated ones
-                            const firstDup = optimizedSlots[duplicatedSlots[0]];
-                            if (firstDup && optimizedSlots[i].id === firstDup.id) {
-                                originalUnstackableItem = { item: optimizedSlots[i], index: i };
-                                break;
+                            // Try duplicating items until adding a full stack would increment signal
+                            for (const itemToDuplicate of availableItems) {
+                                for (let i = 1; i < optimizedSlots.length; i++) {
+                                    if (optimizedSlots[i] === null) {
+                                        optimizedSlots[i] = { ...itemToDuplicate, originalIndex: -1, forceAdjusted: true };
+                                        const newSignal = calculateSignalStrength(optimizedSlots);
+                                        if (newSignal > currentSignal) {
+                                            // Keep this stack but set quantity to 1, then Strategy 5 will fine-tune it
+                                            optimizedSlots[i].quantity = 1;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Check if we've reached the threshold
+                                if (calculateSignalStrength(optimizedSlots) > currentSignal) {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
 
+                // Strategy 5: Final increment pass on all forced items from the END
+                currentSignal = calculateSignalStrength(optimizedSlots);
+                let reachedThreshold = false;
+                while (true) {
+                    let incremented = false;
+                    for (let i = optimizedSlots.length - 1; i >= 1; i--) {
+                        if (optimizedSlots[i] && optimizedSlots[i].forceAdjusted === true) {
+                            const stackLimit = optimizedSlots[i].stack_size || 64;
+                            if (optimizedSlots[i].quantity < stackLimit) {
+                                optimizedSlots[i].quantity++;
+                                const newSignal = calculateSignalStrength(optimizedSlots);
+                                if (newSignal > currentSignal) {
+                                    optimizedSlots[i].quantity--;
+                                    reachedThreshold = true;
+                                    break;
+                                }
+                                incremented = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!incremented || reachedThreshold) break;
+                }
+
+                // Recalculate forceAdjusted flags AFTER quantities have been adjusted
+                // An item is adjusted if: (1) quantity > 1, OR (2) multiple instances exist
+                for (let i = 1; i < optimizedSlots.length; i++) {
+                    if (optimizedSlots[i]) {
+                        const hasMultipleInstances = itemCounts[optimizedSlots[i].id] > 1;
+                        const hasQuantity = (optimizedSlots[i].quantity || 1) > 1;
+                        optimizedSlots[i].forceAdjusted = hasQuantity || hasMultipleInstances;
+                    }
+                }
+
+                // Organize into adjusted vs unadjusted
+                const unadjusted = [];
+                const adjusted = [];
                 for (let i = 1; i < optimizedSlots.length; i++) {
                     if (optimizedSlots[i] !== null) {
-                        const isDuplicated = duplicatedSlots.includes(i);
-                        const isOriginalOfDuplicated = originalUnstackableItem && originalUnstackableItem.index === i;
-                        const isAdjusted = optimizedSlots[i].quantity > 1 || isDuplicated || isOriginalOfDuplicated;
-                        const stackSize = optimizedSlots[i].stack_size || 64;
-
-                        // Mark item as adjusted
-                        optimizedSlots[i].isAdjusted = isAdjusted;
-
-                        if (isAdjusted) {
-                            if (stackSize === 1) {
-                                adjustedUnstackables.push(optimizedSlots[i]);
-                            } else {
-                                adjustedStackables.push(optimizedSlots[i]);
-                            }
+                        if (optimizedSlots[i].forceAdjusted === true) {
+                            optimizedSlots[i].isAdjusted = true;
+                            adjusted.push(optimizedSlots[i]);
                         } else {
+                            optimizedSlots[i].isAdjusted = false;
                             unadjusted.push(optimizedSlots[i]);
                         }
                     }
                 }
 
-                // Sort stackables by absolute quantity only (largest quantity at the back)
-                // 8/16 should come after 3/64 since 8 > 3
-                adjustedStackables.sort((a, b) => a.quantity - b.quantity);
+                // Sort adjusted items
+                adjusted.sort((a, b) => {
+                    const aStack = a.stack_size || 64;
+                    const bStack = b.stack_size || 64;
+                    if (aStack === 1 && bStack !== 1) return -1;
+                    if (aStack !== 1 && bStack === 1) return 1;
+                    return a.quantity - b.quantity;
+                });
 
-                // Adjusted unstackables stay together (original + duplicates)
-                // They go to the front of the adjusted section
-
-                // Reconstruct: [null (slot 0), ...unadjusted, ...adjustedUnstackables, ...adjustedStackables, ...nulls]
-                const result = [null, ...unadjusted, ...adjustedUnstackables, ...adjustedStackables];
-                while (result.length < 54) {
+                // Calculate null padding
+                const nullsNeeded = 53 - unadjusted.length - adjusted.length;
+                const result = [null, ...unadjusted];
+                for (let i = 0; i < nullsNeeded; i++) {
                     result.push(null);
                 }
+                result.push(...adjusted);
 
                 return result;
             };
@@ -2266,9 +2291,373 @@
                 }
             };
 
-            // Reject an item from being used for fill level adjustment
-            const rejectFillLevelItem = (itemId) => {
-                setRejectedItems([...rejectedItems, itemId]);
+            // Toggle display mode and reorder slots for visual consistency
+            const toggleDisplayMode = () => {
+                const newDisplayMode = !displayMode;
+
+                // Always reorder cells when toggling
+                setCells(cells.map(cell => {
+                    if (newDisplayMode) {
+                        // Enabling displayMode: reorder to match optimized display
+                        const optimizedSlots = optimizeForRedstone(cell.slots);
+
+                        // Create new slots array that physically matches the optimized order
+                        // but without the isAdjusted flags and adjusted quantities
+                        const reorderedSlots = optimizedSlots.map(slot => {
+                            if (!slot) return null;
+
+                            // Create clean copy without optimization metadata
+                            // But PRESERVE isDuplicate, forceAdjusted, and userSubstituted flags
+                            const cleanSlot = { ...slot };
+                            delete cleanSlot.quantity;
+                            delete cleanSlot.isAdjusted;
+                            delete cleanSlot.originalIndex;
+                            // Keep isDuplicate, forceAdjusted, and userSubstituted flags if they exist
+
+                            return cleanSlot;
+                        });
+
+                        return { ...cell, slots: reorderedSlots };
+                    } else {
+                        // Disabling displayMode: compact items (remove gaps)
+                        const compactedSlots = [null]; // Slot 0 is always null
+
+                        // Collect all non-null items
+                        for (let i = 1; i < cell.slots.length; i++) {
+                            if (cell.slots[i] !== null) {
+                                compactedSlots.push(cell.slots[i]);
+                            }
+                        }
+
+                        // Fill remaining slots with null
+                        while (compactedSlots.length < 54) {
+                            compactedSlots.push(null);
+                        }
+
+                        return { ...cell, slots: compactedSlots };
+                    }
+                }));
+
+                setDisplayMode(newDisplayMode);
+            };
+
+            // Substitute an adjusted item with another item in displayMode
+            // Works by modifying the RAW cell.slots and letting optimizeForRedstone run on next render
+            const substituteAdjustedItem = (cellId, targetDisplayIndex, sourceDisplayIndex) => {
+                saveToHistory();
+
+                setCells(cells.map(cell => {
+                    if (cell.id !== cellId) return cell;
+
+                    // Step 1: Get display representation to identify which item user clicked
+                    const displaySlots = optimizeForRedstone(cell.slots);
+                    const targetDisplayItem = displaySlots[targetDisplayIndex];
+                    const sourceDisplayItem = displaySlots[sourceDisplayIndex];
+
+                    console.log('=== SUBSTITUTION ATTEMPT ===');
+                    console.log('Target:', targetDisplayItem?.id, 'isAdjusted:', targetDisplayItem?.isAdjusted, 'stack_size:', targetDisplayItem?.stack_size);
+                    console.log('Source:', sourceDisplayItem?.id, 'isAdjusted:', sourceDisplayItem?.isAdjusted, 'stack_size:', sourceDisplayItem?.stack_size);
+
+                    // Verify target is adjusted
+                    if (!targetDisplayItem || !targetDisplayItem.isAdjusted) {
+                        console.log('REJECTED: Target not adjusted');
+                        return cell;
+                    }
+
+                    // Mark all currently adjusted items with forceAdjusted flag
+                    // This prevents re-optimization after substitution
+                    console.log('Marking adjusted items with forceAdjusted:');
+                    for (let i = 1; i < displaySlots.length; i++) {
+                        if (displaySlots[i] && displaySlots[i].isAdjusted && displaySlots[i].originalIndex >= 0) {
+                            const origIdx = displaySlots[i].originalIndex;
+                            if (cell.slots[origIdx]) {
+                                console.log('  Marking', cell.slots[origIdx].id, 'at raw position', origIdx, '(display position', i, ')');
+                                cell.slots[origIdx] = { ...cell.slots[origIdx], forceAdjusted: true };
+                            }
+                        }
+                    }
+
+                    // Step 2: Work with raw slots - make a copy
+                    const newSlots = [...cell.slots];
+                    console.log('Items with forceAdjusted in newSlots:', newSlots.filter((s, i) => i > 0 && s && s.forceAdjusted).map(s => s.id));
+
+                    // Step 3: Build a precise mapping from display items to actual slots
+                    // Track which actual indices we've already matched to handle duplicates
+                    const usedIndices = new Set();
+
+                    const findActualIndexForDisplay = (displayItem) => {
+                        // For items with originalIndex >= 0, use it directly
+                        if (displayItem.originalIndex !== undefined && displayItem.originalIndex >= 0) {
+                            usedIndices.add(displayItem.originalIndex);
+                            return displayItem.originalIndex;
+                        }
+
+                        // For duplicated items (originalIndex === -1 or undefined), match by ID
+                        // Find all raw slots with matching ID that haven't been used yet
+                        for (let i = 1; i < newSlots.length; i++) {
+                            if (newSlots[i] && newSlots[i].id === displayItem.id && !usedIndices.has(i)) {
+                                usedIndices.add(i);
+                                return i;
+                            }
+                        }
+
+                        return -1;
+                    };
+
+                    const targetActualIndex = findActualIndexForDisplay(targetDisplayItem);
+                    const sourceActualIndex = findActualIndexForDisplay(sourceDisplayItem);
+
+                    console.log('Display → Actual mapping:');
+                    console.log('  Target display index:', targetDisplayIndex, '→ actual index:', targetActualIndex);
+                    console.log('  Source display index:', sourceDisplayIndex, '→ actual index:', sourceActualIndex);
+                    console.log('  Target item in newSlots[' + targetActualIndex + ']:', newSlots[targetActualIndex]?.id);
+                    console.log('  Source item in newSlots[' + sourceActualIndex + ']:', newSlots[sourceActualIndex]?.id);
+
+                    if (targetActualIndex === -1) {
+                        console.log('REJECTED: Target actual index not found');
+                        return cell;
+                    }
+
+                    // Case 1: Source is also adjusted (duplication case)
+                    if (sourceDisplayItem && sourceDisplayItem.isAdjusted) {
+                        console.log('=== DUPLICATION CASE ===');
+                        console.log('Source item:', sourceDisplayItem.id, 'at display index', sourceDisplayIndex, 'actual index', sourceActualIndex);
+                        console.log('Target item:', targetDisplayItem.id, 'at display index', targetDisplayIndex, 'actual index', targetActualIndex);
+                        console.log('Source isAdjusted:', sourceDisplayItem.isAdjusted, 'quantity:', sourceDisplayItem.quantity);
+                        console.log('Target isAdjusted:', targetDisplayItem.isAdjusted, 'quantity:', targetDisplayItem.quantity);
+
+                        // Special case: If source and target are the same item, compact them instead of duplicating
+                        if (sourceDisplayItem.id === targetDisplayItem.id) {
+                            console.log('SAME ITEM - Compacting');
+                            // Combine all instances of this item into one
+                            const itemId = sourceDisplayItem.id;
+                            const stackSize = sourceDisplayItem.stack_size || 64;
+
+                            // Count total instances and collect their positions
+                            const positions = [];
+                            for (let i = 1; i < newSlots.length; i++) {
+                                if (newSlots[i] && newSlots[i].id === itemId) {
+                                    positions.push(i);
+                                }
+                            }
+
+                            console.log('Found', positions.length, 'instances of', itemId, 'at positions:', positions);
+                            console.log('Stack size:', stackSize);
+
+                            // If stackable, consolidate into minimum number of stacks
+                            if (stackSize > 1) {
+                                const totalCount = positions.length; // Each instance is quantity 1 in raw slots
+                                const fullStacks = Math.floor(totalCount / stackSize);
+                                const remainder = totalCount % stackSize;
+
+                                console.log('Consolidating into', fullStacks, 'full stacks +', remainder, 'remainder');
+
+                                // Create clean base item
+                                const baseItem = { ...newSlots[positions[0]] };
+                                delete baseItem.quantity;
+                                delete baseItem.isAdjusted;
+                                delete baseItem.originalIndex;
+                                delete baseItem.forceAdjusted;
+
+                                // Remove all instances
+                                for (let i = positions.length - 1; i >= 0; i--) {
+                                    newSlots.splice(positions[i], 1);
+                                }
+
+                                // Add back consolidated stacks at the end
+                                for (let i = 0; i < fullStacks; i++) {
+                                    newSlots.push({ ...baseItem, forceAdjusted: true });
+                                }
+                                if (remainder > 0) {
+                                    newSlots.push({ ...baseItem, forceAdjusted: true });
+                                }
+
+                                // Fill to maintain 54 slots
+                                while (newSlots.length < 54) {
+                                    newSlots.push(null);
+                                }
+
+                                console.log('After compaction, slot count:', newSlots.filter(s => s !== null).length);
+                            }
+                            // If unstackable, keep as is (already marked with forceAdjusted)
+
+                            return { ...cell, slots: newSlots };
+                        }
+
+                        // Normal duplication: different items
+                        console.log('DIFFERENT ITEMS - Duplicating');
+                        console.log('Before duplication - total items:', newSlots.filter((s, i) => i > 0 && s !== null).length);
+
+                        // Create clean copies without optimization metadata
+                        const baseSource = { ...newSlots[sourceActualIndex] };
+                        delete baseSource.quantity;
+                        delete baseSource.isAdjusted;
+                        delete baseSource.originalIndex;
+                        delete baseSource.forceAdjusted;
+                        // Mark as forceAdjusted to keep it in adjusted group
+                        baseSource.forceAdjusted = true;
+
+                        const baseTarget = { ...newSlots[targetActualIndex] };
+                        delete baseTarget.quantity;
+                        delete baseTarget.isAdjusted;
+                        delete baseTarget.originalIndex;
+                        delete baseTarget.forceAdjusted; // Remove from adjusted group when moving back to cell
+
+                        console.log('Base source (with forceAdjusted):', baseSource.id, baseSource.forceAdjusted);
+                        console.log('Base target (no forceAdjusted):', baseTarget.id, baseTarget.forceAdjusted);
+
+                        // Ensure source has forceAdjusted flag (in case it wasn't already marked)
+                        if (!newSlots[sourceActualIndex].forceAdjusted) {
+                            newSlots[sourceActualIndex] = { ...newSlots[sourceActualIndex], forceAdjusted: true };
+                        }
+                        // Replace target with a copy of source (creates duplicate at target position)
+                        newSlots[targetActualIndex] = { ...baseSource };
+
+                        console.log('After replacing target with source copy');
+                        console.log('Items with forceAdjusted:', newSlots.filter((s, i) => i > 0 && s !== null && s.forceAdjusted).length);
+
+                        // Find the first null slot BEFORE the adjusted items to place the displaced target
+                        // We want it in the unadjusted section
+                        let insertPosition = -1;
+                        for (let i = 1; i < newSlots.length; i++) {
+                            if (newSlots[i] === null) {
+                                insertPosition = i;
+                                break;
+                            }
+                        }
+
+                        console.log('Insert displaced target at first null position:', insertPosition);
+
+                        // If we found a null position, place the displaced target there
+                        if (insertPosition !== -1) {
+                            newSlots[insertPosition] = baseTarget;
+                        } else {
+                            // No room - this shouldn't happen in normal use, but log it
+                            console.warn('No room to place displaced target!');
+                        }
+
+                        console.log('After duplication - total items:', newSlots.filter((s, i) => i > 0 && s !== null).length);
+                        console.log('Items with forceAdjusted:', newSlots.filter((s, i) => i > 0 && s !== null && s.forceAdjusted).length);
+                    }
+                    // Case 2: Source is unadjusted
+                    else if (sourceActualIndex !== -1) {
+                        console.log('=== CASE 2: Source is unadjusted ===');
+                        // Check if target item appears multiple times (is a duplicate)
+                        const targetId = targetDisplayItem.id;
+                        const targetCount = newSlots.filter(s => s && s.id === targetId).length;
+
+                        console.log('Target count:', targetCount, 'Target ID:', targetId);
+
+                        if (targetCount > 1) {
+                            console.log('Target is DUPLICATED - Case 2a');
+                            // Target is duplicated
+                            const targetStackSize = targetDisplayItem.stack_size || 64;
+                            const sourceStackSize = sourceDisplayItem.stack_size || 64;
+
+                            // Check if both are unstackables
+                            if (targetStackSize === 1 && sourceStackSize === 1) {
+                                // Replace ALL instances of target unstackable with source
+                                const baseSource = { ...newSlots[sourceActualIndex] };
+                                delete baseSource.quantity;
+                                delete baseSource.isAdjusted;
+                                delete baseSource.originalIndex;
+
+                                // Save one instance of the target to place back in cell
+                                const baseTarget = { ...newSlots[targetActualIndex] };
+                                delete baseTarget.quantity;
+                                delete baseTarget.isAdjusted;
+                                delete baseTarget.originalIndex;
+                                delete baseTarget.forceAdjusted;
+                                delete baseTarget.isDuplicate;
+
+                                const sourceId = baseSource.id;
+
+                                // Remove source FIRST (before replacement) to avoid confusion
+                                newSlots.splice(sourceActualIndex, 1);
+                                newSlots.push(null); // Add null at end to maintain 54 slots
+
+                                // Now find and replace all instances of target (avoiding the source item we just removed)
+                                for (let i = 1; i < newSlots.length; i++) {
+                                    if (newSlots[i] && newSlots[i].id === targetId) {
+                                        // Preserve isDuplicate and forceAdjusted flags
+                                        const wasDuplicate = newSlots[i].isDuplicate;
+                                        const wasForceAdjusted = newSlots[i].forceAdjusted;
+                                        newSlots[i] = { ...baseSource };
+                                        if (wasDuplicate) {
+                                            newSlots[i].isDuplicate = true;
+                                        }
+                                        if (wasForceAdjusted) {
+                                            newSlots[i].forceAdjusted = true;
+                                        }
+                                    }
+                                }
+
+                                // Place the displaced target in the first available null slot
+                                for (let i = 1; i < newSlots.length; i++) {
+                                    if (newSlots[i] === null) {
+                                        newSlots[i] = baseTarget;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Regular duplicate case - just replace the one we dropped onto
+                                const baseSource = { ...newSlots[sourceActualIndex] };
+                                delete baseSource.quantity;
+                                delete baseSource.isAdjusted;
+                                delete baseSource.originalIndex;
+
+                                newSlots[targetActualIndex] = baseSource;
+
+                                // Remove source by splicing to close the gap
+                                newSlots.splice(sourceActualIndex, 1);
+                                newSlots.push(null); // Add null at end to maintain 54 slots
+                            }
+                        } else {
+                            console.log('Target is UNIQUE - Case 2b (swap)');
+                            console.log('Target actual index:', targetActualIndex);
+                            console.log('Source actual index:', sourceActualIndex);
+
+                            // Target is unique - swap source and target positions directly
+
+                            // Save both items
+                            const baseTarget = { ...newSlots[targetActualIndex] };
+                            const targetQuantity = baseTarget.quantity; // Save target's quantity
+                            delete baseTarget.quantity;
+                            delete baseTarget.isAdjusted;
+                            delete baseTarget.originalIndex;
+
+                            const baseSource = { ...newSlots[sourceActualIndex] };
+                            delete baseSource.quantity;
+                            delete baseSource.isAdjusted;
+                            delete baseSource.originalIndex;
+
+                            console.log('Base target:', baseTarget.id, 'forceAdjusted:', baseTarget.forceAdjusted, 'quantity:', targetQuantity);
+                            console.log('Base source:', baseSource.id, 'forceAdjusted:', baseSource.forceAdjusted);
+
+                            // Source goes to target position and becomes adjusted (takes target's place in adjusted group)
+                            // Mark as user-substituted to prevent re-optimization from changing it
+                            baseSource.userSubstituted = true;
+                            baseSource.forceAdjusted = true;
+                            // Give source the same quantity that target had (if any)
+                            if (targetQuantity && targetQuantity > 1) {
+                                baseSource.quantity = targetQuantity;
+                            }
+                            // Target goes to source position in unadjusted section
+                            delete baseTarget.forceAdjusted;
+                            delete baseTarget.userSubstituted;
+
+                            // Simple swap: source goes to target position, target goes to source position
+                            newSlots[targetActualIndex] = baseSource;
+                            newSlots[sourceActualIndex] = baseTarget;
+
+                            console.log('After swap - position', targetActualIndex, ':', newSlots[targetActualIndex].id, 'forceAdjusted:', newSlots[targetActualIndex].forceAdjusted);
+                            console.log('After swap - position', sourceActualIndex, ':', newSlots[sourceActualIndex].id, 'forceAdjusted:', newSlots[sourceActualIndex].forceAdjusted);
+                            console.log('Total items with forceAdjusted:', newSlots.filter((s, i) => i > 0 && s && s.forceAdjusted).length);
+                        }
+                    }
+
+                    return { ...cell, slots: newSlots };
+                }));
             };
 
             // Cell drag handlers
@@ -2500,7 +2889,7 @@
 
                                 {/* Display Mode Toggle */}
                                 <button
-                                    onClick={() => setDisplayMode(!displayMode)}
+                                    onClick={toggleDisplayMode}
                                     className={`px-3 py-1.5 rounded transition-colors whitespace-nowrap text-xs ${displayMode ? 'bg-red-600 text-white' : 'bg-stone-800 text-stone-300 hover:bg-stone-700'}`}
                                     title={displayMode ? "Redstone Mode: Optimized for signal strength" : "Normal Mode"}
                                 >
@@ -2879,7 +3268,7 @@
                         <div className="flex flex-wrap gap-6">
                             {cells.map((cell, cellIndex) => {
                                 const isDragOverThisCell = dragOverCell === cell.id;
-                                const displaySlots = displayMode ? optimizeForRedstone(cell.slots, rejectedItems) : cell.slots;
+                                const displaySlots = displayMode ? optimizeForRedstone(cell.slots) : cell.slots;
                                 const signalStrength = displayMode ? calculateSignalStrength(displaySlots) : null;
 
                                 return (
@@ -2965,12 +3354,12 @@
                                             return (
                                                 <div
                                                     key={slotIndex}
-                                                    draggable={!displayMode && !isReserved && !!slot}
-                                                    onDragStart={(e) => !displayMode && !isReserved && slot && handleItemDragStart(e, slot, { type: 'slot', cellId: cell.id, slotIndex })}
-                                                    onDragEnd={!displayMode && !isReserved ? handleItemDragEnd : undefined}
-                                                    onDragOver={(e) => !displayMode && !isReserved && handleItemDragOver(e, cell.id, slotIndex)}
-                                                    onDragLeave={!displayMode && !isReserved ? handleItemDragLeave : undefined}
-                                                    onDrop={(e) => !displayMode && !isReserved && handleItemDrop(e, cell.id, slotIndex)}
+                                                    draggable={!isReserved && !!slot}
+                                                    onDragStart={(e) => !isReserved && slot && handleItemDragStart(e, slot, { type: 'slot', cellId: cell.id, slotIndex })}
+                                                    onDragEnd={!isReserved ? handleItemDragEnd : undefined}
+                                                    onDragOver={(e) => !isReserved && handleItemDragOver(e, cell.id, slotIndex)}
+                                                    onDragLeave={!isReserved ? handleItemDragLeave : undefined}
+                                                    onDrop={(e) => !isReserved && handleItemDrop(e, cell.id, slotIndex)}
                                                     onClick={(e) => {
                                                         if (displayMode || isReserved) return;
                                                         e.stopPropagation();
@@ -2985,7 +3374,7 @@
                                                         isReserved
                                                             ? 'bg-stone-900 border-stone-800 cursor-not-allowed opacity-50'
                                                             : displayMode
-                                                            ? `bg-stone-700 ${slot ? 'cursor-default' : ''} ${isAdjusted ? 'border-2 border-red-500 shadow-red-500/50 shadow-md' : 'border-stone-600'}`
+                                                            ? `bg-stone-700 ${slot ? 'cursor-grab active:cursor-grabbing' : ''} ${isAdjusted ? 'border-2 border-red-500 shadow-red-500/50 shadow-md' : 'border-stone-600'} ${isDragOver && isAdjusted ? 'drag-over-slot' : ''}`
                                                             : `bg-stone-700 ${slot ? 'cursor-grab active:cursor-grabbing' : ''} ${isDragOver ? 'drag-over-slot' : isSelected ? 'border-2 border-blue-400 bg-blue-900 bg-opacity-30' : 'border-stone-600 hover:border-amber-600'}`
                                                     }`}
                                                     title={isReserved ? 'Reserved slot' : (slot ? slot.name : '')}
@@ -3013,18 +3402,6 @@
                                                                     className="absolute top-0 right-0 bg-red-600 text-white rounded-bl text-xs w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
                                                                 >
                                                                     ×
-                                                                </button>
-                                                            )}
-                                                            {isAdjusted && (
-                                                                <button
-                                                                    onClick={(e) => {
-                                                                        e.stopPropagation();
-                                                                        rejectFillLevelItem(slot.id);
-                                                                    }}
-                                                                    className="absolute top-0 left-0 bg-orange-600 text-white rounded-br text-xs w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                                                                    title="Reject this item for fill level adjustment"
-                                                                >
-                                                                    ⊘
                                                                 </button>
                                                             )}
                                                         </>
