@@ -387,7 +387,7 @@ export default function MinecraftItemBuilder() {
   const [catalogueWidth, setCatalogueWidth] = useState(400); // Width in pixels
   const [isDraggingDivider, setIsDraggingDivider] = useState(false);
   const [history, setHistory] = useState([]); // Store last 10 cell states for undo
-
+  const [useRegex, setUseRegex] = useState(false);
   // Load items from JSON file
   useEffect(() => {
     fetch('items.json?v=' + Date.now())
@@ -610,7 +610,7 @@ export default function MinecraftItemBuilder() {
     }
 
     // Apply search filter with enhanced logic
-    if (searchTerm !== '') {
+    if (searchTerm !== '' && !useRegex) {
       // Split by comma for OR groups
       const orGroups = searchTerm.split(',').map(t => t.trim()).filter(t => t.length > 0);
 
@@ -641,7 +641,20 @@ export default function MinecraftItemBuilder() {
         });
       });
     }
-
+    if (searchTerm !== '' && useRegex) {
+      filtered = filtered.filter(item => {
+        const itemName = item.name.toLowerCase();
+        const itemId = item.id.toLowerCase();
+        let regex;
+        try {
+          regex = new RegExp(`${searchTerm}`);
+          return regex.test(itemName) || regex.test(itemId);
+        }
+        catch {
+          return true;
+        }
+      });
+    }
     // Apply stats-based sorting and filtering if enabled
     if (statsSortMode !== 'none' && playerStats) {
       // Only filter out items without stats if min is not null (0 or higher)
@@ -3143,7 +3156,20 @@ export default function MinecraftItemBuilder() {
                         )}
                       </div>
                     </div>
-
+                    <div className="mt-2">
+                        <div className="text-sm font-semibold text-amber-400 mb-1">Search Settings</div>
+                        <div className="flex gap-4">
+                            <label className="flex items-center gap-2 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={useRegex}
+                                    onChange={(e) => setUseRegex(e.target.checked)}
+                                    className="w-4 h-4 cursor-pointer accent-amber-500"
+                                />
+                                <span className="text-sm text-stone-300">Use regex for search</span>
+                            </label>
+                        </div>
+                    </div>
                     {/* Right side: Color Picker */}
                     <div className="flex-1 flex flex-col items-center">
                       <div className="text-sm font-semibold text-amber-400 mb-2">Color Filter</div>
